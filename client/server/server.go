@@ -772,7 +772,7 @@ func (s *Server) beginSSOLogin(ctx context.Context, config *profilemanager.Confi
 		return nil, err
 	}
 
-	if resp := s.pendingOAuthFlowResponse(ctx, oAuthFlow, msg.GetUseDeviceAuth()); resp != nil {
+	if resp := s.pendingOAuthFlowResponse(ctx, oAuthFlow); resp != nil {
 		state.Set(internal.StatusNeedsLogin)
 		return resp, nil
 	}
@@ -800,21 +800,24 @@ func (s *Server) beginSSOLogin(ctx context.Context, config *profilemanager.Confi
 }
 
 // pendingOAuthFlowResponse returns the in-flight flow's response when it
-// targets the same IdP client and has enough time left for the user to finish
-// the browser leg, so a second login joins the pending flow instead of opening
-// a competing one. A flow too close to expiry has its waiter cancelled and nil
+// targets the same IdP client with the same flow type and has enough time left
+// for the user to finish the browser leg, so a second login joins the pending
+// flow instead of opening a competing one. A flow that no longer matches — too
+// close to expiry, or a different flow type — has its waiter cancelled and nil
 // returned, leaving the caller to start a fresh flow.
-func (s *Server) pendingOAuthFlowResponse(ctx context.Context, oAuthFlow auth.OAuthFlow, useDeviceAuth bool) *proto.LoginResponse {
+func (s *Server) pendingOAuthFlowResponse(ctx context.Context, oAuthFlow auth.OAuthFlow) *proto.LoginResponse {
 	if s.oauthAuthFlow.flow == nil || s.oauthAuthFlow.flow.GetClientID(ctx) != oAuthFlow.GetClientID(ctx) {
 		return nil
 	}
 
+	// Compare the flow auth.NewOAuthFlow actually selected, not the force flag
+	// that was passed to it: a headless Linux/FreeBSD client — or a PKCE init
+	// failure — yields a device flow with the flag unset, and reading the flag
+	// instead would reject the pending flow and issue a second device code.
 	_, cachedIsDevice := s.oauthAuthFlow.flow.(*auth.DeviceAuthorizationFlow)
-	if cachedIsDevice != useDeviceAuth {
-		return nil
-	}
+	_, requestedIsDevice := oAuthFlow.(*auth.DeviceAuthorizationFlow)
 
-	if s.oauthAuthFlow.expiresAt.After(time.Now().Add(90 * time.Second)) {
+	if cachedIsDevice == requestedIsDevice && s.oauthAuthFlow.expiresAt.After(time.Now().Add(90*time.Second)) {
 		log.Debugf("using previous oauth flow info")
 		return &proto.LoginResponse{
 			NeedsSSOLogin:           true,
@@ -824,6 +827,9 @@ func (s *Server) pendingOAuthFlowResponse(ctx context.Context, oAuthFlow auth.OA
 		}
 	}
 
+	// The cached flow will not be reused and beginSSOLogin is about to overwrite
+	// it, so stop its waiter first — otherwise it keeps polling a flow nothing
+	// references any more.
 	log.Warnf("canceling previous waiting execution")
 	if s.oauthAuthFlow.waitCancel != nil {
 		s.oauthAuthFlow.waitCancel()
